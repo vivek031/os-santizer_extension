@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+import os
+import json
+
+# Dump data_SPEC.json
+
+# TODO: spec_result_dir expects directory structure like:
+# ├── FedoraBase00
+# │         ├── cpu_intspeed_log_0_all_...
+# │         ├── ...
+# │         ├── cpu_intspeed_log_9_all_...
+# │         └── result
+# │             ├── CPU2017.001.intspeed.test.csv
+# │             ├── CPU2017.002.intspeed.test.csv
+# │             ├── ...
+# ├── FedoraBase01
+# ├── FedoraBase...
+
+# Where FedoraBase00 contains files from `eval_SPEC_intspeed_00.sh` and so on.
+# `result` directory in each FedoraBase.. is created by SPEC
+# --------------------------------------------------------------
+spec_result_dir = ""
+
+clones = os.listdir(spec_result_dir)
+
+SPEC_wall_time = {}
+
+for machine in clones:
+    cpu_intspeed_files = []
+    if "FedoraBase" in machine:
+        curr_dir = spec_result_dir + "/" + machine
+        files = os.listdir(curr_dir)
+
+        for file in files:
+            if "cpu_intspeed" in file:
+                cpu_intspeed_files.append(file)
+
+        for file in cpu_intspeed_files:
+            with open(curr_dir + "/" + file, "r") as reader:
+                for line in reader:
+                    if "format: CSV" in line:
+                        csv_file = line.split("/")[-1].rstrip()
+                        with open(curr_dir + "/" + "result/" + csv_file, "r") as csv_reader:
+                            for result_line in csv_reader:
+                                # Explanation:
+                                # # We used to report both times of 1x SPEC run with
+                                # # if "iteration #" in line:
+                                # # Now, we only take the biggest time of 1x SPEC run with
+                                # # if "peak NR" in line:
+                                if "peak NR" in result_line:
+                                    values = result_line.split(",")
+                                    benchmark_name = values[0] + values[-1].rstrip() + file
+                                    value = float(values[2])
+                                    SPEC_wall_time[benchmark_name] = value
+
+
+with open('./../data/data_SPEC.json', 'w') as fp:
+    json.dump(SPEC_wall_time, fp)

@@ -1,0 +1,225 @@
+load("@cargo_toml_version//:version.bzl", "VERSION")
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_shared_library")
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("//bazel:llvm_archive.bzl", "llvm_archive", "llvm_archive_for_platform")
+load(
+    "//bazel:release.bzl",
+    "bpf_linker_release",
+    "release_linux_filegroup",
+    "release_macos_filegroup",
+    "release_windows_filegroup",
+)
+
+exports_files(["pyproject.toml"])
+
+# If Cargo.toml remaps any crate names, this tells Bazel how to pass the right
+# `--extern` flags.
+# (For example `my_serde = { package = "serde", version = "1.0" }`)
+CRATE_ALIASES = aliases()
+
+# Bazel supplies LLVM through :llvm, so the LLVM crates provide bindings
+# without linking LLVM themselves.
+CRATE_FEATURES = [
+    "llvm-23",
+    "no-llvm-linking",
+]
+
+CRATE_DEPS = all_crate_deps(normal = True) + [":llvm"]
+
+# Unit tests compile both [dependencies] and [dev-dependencies] from Cargo.toml.
+TEST_DEPS = all_crate_deps(
+    normal = True,
+    normal_dev = True,
+) + [":llvm"]
+
+LIB_SRCS = glob(
+    ["src/**/*.rs"],
+    exclude = ["src/bin/**/*.rs"],
+)
+
+BIN_SRCS = glob(["src/bin/**/*.rs"])
+
+LLVM_DEPS = [
+    "@llvm-project//llvm:Analysis",
+    "@llvm-project//llvm:AsmParser",
+    "@llvm-project//llvm:BPFAsmParser",
+    "@llvm-project//llvm:BPFCodeGen",
+    "@llvm-project//llvm:BPFDisassembler",
+    "@llvm-project//llvm:BPFInfo",
+    "@llvm-project//llvm:BPFUtilsAndDesc",
+    "@llvm-project//llvm:BitReader",
+    "@llvm-project//llvm:BitWriter",
+    "@llvm-project//llvm:CodeGen",
+    "@llvm-project//llvm:Core",
+    "@llvm-project//llvm:DebugInfoBTF",
+    "@llvm-project//llvm:DebugInfoDWARF",
+    "@llvm-project//llvm:Demangle",
+    "@llvm-project//llvm:IPO",
+    "@llvm-project//llvm:IRReader",
+    "@llvm-project//llvm:InstCombine",
+    "@llvm-project//llvm:Linker",
+    "@llvm-project//llvm:MC",
+    "@llvm-project//llvm:MCParser",
+    "@llvm-project//llvm:Object",
+    "@llvm-project//llvm:Passes",
+    "@llvm-project//llvm:Scalar",
+    "@llvm-project//llvm:Support",
+    "@llvm-project//llvm:Target",
+    "@llvm-project//llvm:TargetParser",
+    "@llvm-project//llvm:TransformUtils",
+    "@llvm-project//llvm:Vectorize",
+]
+
+cc_library(
+    name = "llvm",
+    # @llvm builds libc++ for Linux and Windows targets and provides it via the
+    # cc_toolchain's `static_runtime_library`.
+    # For macOS targets @llvm uses the hermetic macOS SDK libc++. The toolchain
+    # doesn't know to inject the link flag so we do it explicitly.
+    linkopts = select({
+        "@platforms//os:macos": ["-lc++"],
+        "//conditions:default": [],
+    }),
+    visibility = ["//tests:__pkg__"],
+    deps = LLVM_DEPS,
+)
+
+cc_shared_library(
+    name = "LLVM",
+    tags = ["manual"],
+    deps = LLVM_DEPS,
+)
+
+llvm_archive(
+    name = "llvm-archive",
+    cxxstdlibs = {
+        "@llvm-project//libcxx:libcxx.static": "liblibcxx.a",
+        "@llvm-project//libcxxabi:libcxxabi.static": "liblibcxxabi.a",
+    },
+    filecheck = "@llvm-project//llvm:FileCheck",
+    llvm = ":llvm",
+    shared = ":LLVM",
+)
+
+LLVM_ARCHIVE_TARGETS = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-unknown-linux-musl",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+]
+
+[
+    llvm_archive_for_platform(
+        name = "llvm-archive-" + target,
+        archive = ":llvm-archive",
+        target_platform = "@rules_rs//rs/platforms:" + target,
+    )
+    for target in LLVM_ARCHIVE_TARGETS
+]
+
+filegroup(
+    name = "llvm-archives",
+    testonly = True,
+    srcs = [":llvm-archive-" + target for target in LLVM_ARCHIVE_TARGETS],
+    tags = ["manual"],
+)
+
+rust_library(
+    name = "bpf-linker-lib",
+    srcs = LIB_SRCS,
+    aliases = CRATE_ALIASES,
+    crate_features = CRATE_FEATURES,
+    crate_name = "bpf_linker",
+    version = VERSION,
+    visibility = ["//visibility:public"],
+    deps = CRATE_DEPS,
+)
+
+rust_binary(
+    name = "bpf-linker",
+    srcs = BIN_SRCS,
+    aliases = CRATE_ALIASES,
+    crate_features = CRATE_FEATURES,
+    crate_name = "bpf_linker",
+    crate_root = "src/bin/bpf-linker.rs",
+    version = VERSION,
+    visibility = ["//visibility:public"],
+    deps = CRATE_DEPS + [":bpf-linker-lib"],
+)
+
+# Run unit tests declared in the library crate.
+rust_test(
+    name = "bpf-linker-unit-test",
+    aliases = CRATE_ALIASES,
+    crate = ":bpf-linker-lib",
+    crate_features = CRATE_FEATURES,
+    deps = TEST_DEPS,
+)
+
+# Run unit tests declared in the binary crate.
+rust_test(
+    name = "bpf-linker-bin-unit-test",
+    srcs = BIN_SRCS,
+    aliases = CRATE_ALIASES,
+    crate_features = CRATE_FEATURES,
+    crate_name = "bpf_linker",
+    crate_root = "src/bin/bpf-linker.rs",
+    deps = TEST_DEPS + [":bpf-linker-lib"],
+)
+
+bpf_linker_release(
+    name = "bpf-linker-release",
+    binary = ":bpf-linker",
+)
+
+RELEASE_ARCHES = [
+    "aarch64",
+    "x86_64",
+]
+
+RELEASE_FILEGROUPS = {
+    "apple-darwin": release_macos_filegroup,
+    "pc-windows-gnullvm": release_windows_filegroup,
+    "unknown-linux-musl": release_linux_filegroup,
+}
+
+[
+    release_filegroup(
+        name = "release-%s-%s" % (arch, target_suffix),
+        srcs = [":bpf-linker-release"],
+        tags = ["manual"],
+        target_platform = "@rules_rs//rs/platforms:%s-%s" % (arch, target_suffix),
+    )
+    for target_suffix, release_filegroup in RELEASE_FILEGROUPS.items()
+    for arch in RELEASE_ARCHES
+]
+
+[
+    release_filegroup(
+        name = "release-debuginfo-%s-%s" % (arch, target_suffix),
+        srcs = [":bpf-linker-release-debuginfo"],
+        tags = ["manual"],
+        target_platform = "@rules_rs//rs/platforms:%s-%s" % (arch, target_suffix),
+    )
+    for target_suffix, release_filegroup in RELEASE_FILEGROUPS.items()
+    for arch in RELEASE_ARCHES
+]
+
+filegroup(
+    name = "release-archives",
+    srcs = [
+        archive
+        for target_suffix in RELEASE_FILEGROUPS
+        for arch in RELEASE_ARCHES
+        for archive in [
+            ":release-%s-%s" % (arch, target_suffix),
+            ":release-debuginfo-%s-%s" % (arch, target_suffix),
+        ]
+    ],
+    tags = ["manual"],
+)

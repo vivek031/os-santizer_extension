@@ -1,0 +1,7 @@
+target/
+*.core
+vgcore.*
+~san.log
+os-sanitizer/calibration/data/
+os-sanitizer/evaluation/quickbench/results/
+os-sanitizer/evaluation/quickbench/inputs/data.tar

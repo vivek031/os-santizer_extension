@@ -1,0 +1,568 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+
+  pull_request:
+
+  release:
+    types: [published]
+
+  schedule:
+    # Validate the committed Rust toolchains and dependencies every day.
+    - cron: 00 4 * * *
+
+env:
+  # This key is intentionally public so fork pull requests can use BuildBuddy.
+  BUILDBUDDY_API_KEY: 5CeVmFS0jDnutd00x9Xl
+  CARGO_TERM_COLOR: always
+  TAG_PREFIX: ghcr.io/${{ github.repository_owner }}/llvm
+  # Suffix used to distinguish incompatible LLVM build variants.
+  # This lets us roll out changes to the LLVM build in a pull request
+  # without conflicting with artifacts produced on the main branch.
+  LLVM_BUILD_REV: 4
+  LATEST_LLVM: 23
+
+permissions: {}
+
+jobs:
+  prepare:
+    name: resolve rustc LLVM
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      llvm: ${{ steps.llvm.outputs.llvm }}
+      llvm-targets: ${{ steps.llvm.outputs.llvm-targets }}
+      rust-toolchains: ${{ steps.pin.outputs.rust-toolchains }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve the committed Rust toolchains and LLVM
+        id: pin
+        run: |
+          set -euo pipefail
+
+          toolchains=$(python3 -B scripts/rustc-llvm.py toolchains)
+          printf 'rust-toolchains=%s\n' "$toolchains" >> "$GITHUB_OUTPUT"
+
+      - name: Configure LLVM builds
+        id: llvm
+        run: |
+          set -euo pipefail
+
+          llvm=$(python3 -B scripts/rustc-llvm.py configurations)
+          llvm_targets=$(
+            bazel query 'labels(srcs, //:llvm-archives)' --output=label |
+              sed 's|^//:llvm-archive-||' |
+              paste -sd ' '
+          )
+          printf 'llvm=%s\nllvm-targets=%s\n' \
+            "$llvm" "$llvm_targets" >> "$GITHUB_OUTPUT"
+
+  llvm:
+    needs: prepare
+    permissions:
+      contents: read
+      # Needed to upload LLVM binaries as OCI artifacts to GHCR.
+      packages: write
+    runs-on: ubuntu-latest
+    name: llvm (${{ matrix.llvm }})
+    strategy:
+      matrix:
+        llvm:
+          - 21
+          - 22
+          - 23
+    env:
+      LLVM_TARGETS: ${{ needs.prepare.outputs.llvm-targets }}
+    steps:
+      - uses: oras-project/setup-oras@v2
+
+      - name: Login to ghcr.io
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          oras login ghcr.io --username "${{ github.actor }}" --password-stdin <<< "$GH_TOKEN"
+
+      - name: Check LLVM artifacts
+        id: artifact-restore
+        env:
+          LLVM_COMMIT: ${{ fromJSON(needs.prepare.outputs.llvm)[matrix.llvm].commit }}
+        run: |
+          set -euxo pipefail
+          missing=false
+          for target in $LLVM_TARGETS; do
+            ref="${{ env.TAG_PREFIX }}:${LLVM_COMMIT}-${target}-${{ env.LLVM_BUILD_REV }}"
+            if output=$(oras manifest fetch --descriptor "$ref" 2>&1); then
+              continue
+            fi
+            # ORAS uses the same exit status for missing manifests and registry
+            # errors. Rebuild only when GHCR explicitly reports a cache miss.
+            if [[ $output != *": not found" ]]; then
+              printf '%s\n' "$output" >&2
+              exit 1
+            fi
+            missing=true
+          done
+          echo "missing=$missing" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        if: steps.artifact-restore.outputs.missing == 'true'
+
+      - name: Apply the rustc LLVM candidate
+        if: steps.artifact-restore.outputs.missing == 'true'
+        env:
+          MODULE: ${{ fromJSON(needs.prepare.outputs.llvm)[matrix.llvm].module }}
+        run: |
+          if [[ -n $MODULE ]]; then
+            printf '%s' "$MODULE" | base64 --decode > MODULE.bazel
+          fi
+
+      - name: Build and package LLVM with Bazel
+        if: steps.artifact-restore.outputs.missing == 'true'
+        run: |
+          set -euo pipefail
+          # These archives are intended for general use with linkers that may
+          # use an older LLVM. Disable ThinLTO so they contain native objects
+          # instead of version-specific LLVM bitcode.
+          bazel build //:llvm-archives \
+            --config=release \
+            --config=remote \
+            --features=-thin_lto \
+            --remote_timeout=120 \
+            --remote_header=x-buildbuddy-api-key="$BUILDBUDDY_API_KEY"
+
+      - name: Publish LLVM OCI artifact
+        # Build jobs fetch commit-tagged archives, so same-repo PRs must be
+        # able to publish them when selecting a new LLVM commit.
+        #
+        # GitHub does not allow foreign-repository pull requests to push
+        # container images. Attempting to do so fails with:
+        #
+        #   Error response from registry: denied: installation not allowed to
+        #   Write organization package
+        #
+        # Disable artifact publishing for forked pull requests. This
+        # restriction is a reasonable security measure.
+        if: >-
+          steps.artifact-restore.outputs.missing == 'true' &&
+          (
+            github.ref == format('refs/heads/{0}', github.event.repository.default_branch) ||
+            github.event_name == 'release' ||
+            github.event.pull_request.head.repo.full_name == github.repository
+          )
+        env:
+          LLVM_COMMIT: ${{ fromJSON(needs.prepare.outputs.llvm)[matrix.llvm].commit }}
+        working-directory: bazel-bin
+        run: |
+          set -euxo pipefail
+          for target in $LLVM_TARGETS; do
+            sha="${{ env.TAG_PREFIX }}:${LLVM_COMMIT}-${target}-${{ env.LLVM_BUILD_REV }}"
+            oras push "$sha" \
+              --artifact-type application/vnd.aya.llvm.install \
+              "llvm-archive-${target}.tar.zst:application/vnd.aya.llvm.install.layer.v1.tar+zstd"
+          done
+
+      - name: Publish validated LLVM version
+        if: >-
+          github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        env:
+          LLVM_COMMIT: ${{ fromJSON(needs.prepare.outputs.llvm)[matrix.llvm].commit }}
+        run: |
+          set -euxo pipefail
+          for target in $LLVM_TARGETS; do
+            sha="${{ env.TAG_PREFIX }}:${LLVM_COMMIT}-${target}-${{ env.LLVM_BUILD_REV }}"
+            version="${{ env.TAG_PREFIX }}:${{ matrix.llvm }}-${target}-${{ env.LLVM_BUILD_REV }}"
+            oras tag "$sha" "$version"
+          done
+
+  lint-stable:
+    needs: prepare
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ fromJSON(needs.prepare.outputs.rust-toolchains).stable }}
+          components: clippy, rust-src
+
+      - name: Run clippy
+        run: cargo clippy --features llvm-23,no-llvm-linking --all-targets --workspace -- --deny warnings
+
+  lint-nightly:
+    needs: prepare
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ fromJSON(needs.prepare.outputs.rust-toolchains).nightly }}
+          components: rustfmt, rust-src
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  bazel:
+    needs: prepare
+    name: bazel (${{ matrix.os }}, ${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+        target:
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check Starlark
+        run: bazel run //bazel/format:format.check
+
+      - name: Check production target without dev dependencies
+        run: |
+          bazel --noworkspace_rc query //:bpf-linker \
+            --ignore_dev_dependency --lockfile_mode=off
+
+      - name: Test
+        run: |
+          set -euo pipefail
+          # The default JVM heap is under 2 GB on 7 GB macOS runners.
+          # Bazel's default test toolchain requires the execution platform to
+          # match the target platform constraints. Disable it because the musl
+          # test binaries are statically linked and can run on the regular
+          # glibc remote workers.
+          bazel --host_jvm_args=-Xmx4g test //... \
+            --config=remote \
+            --platforms=@rules_rs//rs/platforms:${{ matrix.target }} \
+            --@bazel_tools//tools/test:incompatible_use_default_test_toolchain=false \
+            --remote_header=x-buildbuddy-api-key="$BUILDBUDDY_API_KEY"
+
+  build:
+    permissions:
+      contents: read
+      # Needed to pull LLVM binaries as OCI artifacts from GHCR.
+      packages: read
+    runs-on: ${{ matrix.platform.os }}
+    # We work with two git repositories in this workflow:
+    #
+    # - bpf-linker
+    # - aya (for integration tests)
+    #
+    # Cargo searches for `.cargo` directories recursively in all parent
+    # directories. Therefore, nesting different Rust projects with their own
+    # `.cargo/config.toml` files in the same hierarchy (one nested in another)
+    # causes cargo to read and merge both configurations.
+    #
+    # To avoid that, we clone both repositories in separate directories inside
+    # the workspace.
+    defaults:
+      run:
+        working-directory: bpf-linker
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain:
+          - 1.94.0
+          - ${{ fromJSON(needs.prepare.outputs.rust-toolchains).stable }}
+          - ${{ fromJSON(needs.prepare.outputs.rust-toolchains).beta }}
+          - ${{ fromJSON(needs.prepare.outputs.rust-toolchains).nightly }}
+        platform:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          # We don't use ubuntu-latest because we care about the apt packages available.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+    name: target=${{ matrix.platform.target }} rustc=${{ matrix.toolchain }}
+    needs:
+      - prepare
+      - llvm
+
+    env:
+      RUST_BACKTRACE: full
+      # Features that have to be excluded when running `cargo hack --feature-powerset`
+      # and intending to link dynamically.
+      LLVM_EXCLUDE_FEATURES_DYNAMIC: llvm-link-static,no-llvm-linking
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: bpf-linker
+
+      - name: Install Rust ${{ matrix.toolchain }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          targets: ${{ matrix.platform.target }}
+          components: rust-src
+
+      - name: Select LLVM for the installed compiler
+        id: rustc-llvm
+        run: |
+          set -euo pipefail
+          selection=$(rustc -vV | python3 -B scripts/rustc-llvm.py llvm)
+          llvm=$(jq -r .llvm <<< "$selection")
+          excluded=$(jq -r '.["exclude-features"]' <<< "$selection")
+          printf 'llvm=%s\nexclude-features=%s\n' "$llvm" "$excluded" >> "$GITHUB_OUTPUT"
+          printf 'LLVM_FEATURES_DYNAMIC=llvm-%s\nLLVM_FEATURES_STATIC=llvm-%s,llvm-link-static\n' \
+            "$llvm" "$llvm" >> "$GITHUB_ENV"
+
+      - name: Add clang to PATH
+        if: runner.os == 'Linux'
+        # ubuntu-22.04 comes with clang 13-15[0]; support for signed and 64bit
+        # enum values was added in clang 15[1] which isn't in `$PATH`.
+        #
+        # [0] https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2204-Readme.md
+        #
+        # [1] https://github.com/llvm/llvm-project/commit/dc1c43d
+        run: echo /usr/lib/llvm-15/bin >> $GITHUB_PATH
+
+      - name: Enforce dynamic linking
+        run: echo "RUSTFLAGS=-C target-feature=-crt-static" >> $GITHUB_ENV
+
+      - name: Install btfdump
+        run: cargo install btfdump
+
+      - uses: oras-project/setup-oras@v2
+
+      - name: Login to ghcr.io
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          oras login ghcr.io --username "${{ github.actor }}" --password-stdin <<< "$GH_TOKEN"
+
+      - name: Restore LLVM from ghcr.io
+        env:
+          LLVM_COMMIT: ${{ fromJSON(needs.prepare.outputs.llvm)[steps.rustc-llvm.outputs.llvm].commit }}
+        run: |
+          set -euxo pipefail
+          ref="${{ env.TAG_PREFIX }}:${LLVM_COMMIT}-${{ matrix.platform.target }}-${{ env.LLVM_BUILD_REV }}"
+          digest=$(oras manifest fetch "$ref" | jq -r '.layers[0].digest')
+          LLVM_INSTALL_DIR="$(pwd)/llvm-install"
+          mkdir -p "$LLVM_INSTALL_DIR"
+          oras blob fetch "${ref}@${digest}" --output - | tar --zstd -xf - -C "$LLVM_INSTALL_DIR"
+          echo "${LLVM_INSTALL_DIR}/bin" >> "$GITHUB_PATH"
+          echo "LLVM_PREFIX=${LLVM_INSTALL_DIR}" >> "$GITHUB_ENV"
+          echo "CXXSTDLIB=libcxx,libcxxabi" >> "$GITHUB_ENV"
+          echo "CXXSTDLIB_PATH=${LLVM_INSTALL_DIR}/lib" >> "$GITHUB_ENV"
+          echo "ZLIB_PATH=${LLVM_INSTALL_DIR}/lib" >> "$GITHUB_ENV"
+          echo "LIBZSTD_PATH=${LLVM_INSTALL_DIR}/lib" >> "$GITHUB_ENV"
+
+      # llvm-sys discovers link flags at build script time; these are cached by cargo. The cached
+      # flags may be incorrect when the cache is reused across LLVM versions.
+      - name: Bust llvm-sys cache
+        run: |
+          set -euxo pipefail
+          cargo clean --target ${{ matrix.platform.target }} -p llvm-sys
+          cargo clean --target ${{ matrix.platform.target }} -p llvm-sys --release
+
+      - name: Check (default features)
+        if: steps.rustc-llvm.outputs.llvm == env.LATEST_LLVM
+        run: cargo check --target ${{ matrix.platform.target }}
+
+      - name: Build (default features)
+        if: steps.rustc-llvm.outputs.llvm == env.LATEST_LLVM
+        run: cargo build --target ${{ matrix.platform.target }}
+
+      - uses: taiki-e/install-action@v2.87.1
+        with:
+          tool: cargo-hack
+
+      - name: Check (dynamic linking, feature powerset)
+        run: |
+          cargo hack --target ${{ matrix.platform.target }} \
+            check --feature-powerset --exclude-features \
+            ${{ env.LLVM_EXCLUDE_FEATURES_DYNAMIC }},${{ steps.rustc-llvm.outputs.exclude-features }},${{ matrix.platform.exclude-features }} \
+            --features ${{ env.LLVM_FEATURES_DYNAMIC }}
+
+      - name: Build (dynamic linking, feature powerset)
+        run: |
+          cargo hack --target ${{ matrix.platform.target }} \
+            hack build --feature-powerset --exclude-features \
+            ${{ env.LLVM_EXCLUDE_FEATURES_DYNAMIC }},${{ steps.rustc-llvm.outputs.exclude-features }},${{ matrix.platform.exclude-features }} \
+            --features ${{ env.LLVM_FEATURES_DYNAMIC }}
+
+      # Toolchains provided by rustup include standard library artifacts
+      # only for Tier 1 targets, which do not include BPF targets.
+      #
+      # The default workaround is to use the `rustc-build-sysroot` crate to
+      # build a custom sysroot with the required BPF standard library before
+      # running compiler tests.
+      #
+      # `RUSTC_BOOTSTRAP` is needed to use `rustc-build-sysroot` on stable Rust.
+      - name: Test (sysroot built on demand, dynamic linking)
+        run: |
+          RUSTC_BOOTSTRAP=1 cargo hack --target ${{ matrix.platform.target }} \
+            test --feature-powerset --exclude-features \
+            ${{ env.LLVM_EXCLUDE_FEATURES_DYNAMIC }},${{ steps.rustc-llvm.outputs.exclude-features }},${{ matrix.platform.exclude-features }} \
+            --features ${{ env.LLVM_FEATURES_DYNAMIC }}
+
+      # To make things easier for package maintainers, the step of building a
+      # custom sysroot can be skipped by setting the `BPFEL_SYSROOT_DIR`
+      # environment variable to the path of the prebuilt BPF sysroot.
+      #
+      # Test this configuration by prebuilding the BPF standard library
+      # manually.
+      #
+      # `RUSTC_BOOTSTRAP` is needed to make `xtask build-std` work on stable
+      # Rust.
+      - name: Build BPF standard library
+        run: |
+          set -euxo pipefail
+
+          RUSTC_SRC="$(rustc --print sysroot)/lib/rustlib/src/rust/library"
+          BPFEL_SYSROOT_DIR="$(pwd)/bpf-sysroot"
+          RUSTC_BOOTSTRAP=1 cargo xtask build-std \
+            --rustc-src "$RUSTC_SRC" \
+            --sysroot-dir "$BPFEL_SYSROOT_DIR" \
+            --target bpfel-unknown-none
+
+      - name: Test (prebuilt BPF standard libary, dynamic linking)
+        run: |
+          BPFEL_SYSROOT_DIR="$(pwd)/bpf-sysroot" \
+            cargo hack --target ${{ matrix.platform.target }} test \
+            --feature-powerset --exclude-features \
+            ${{ env.LLVM_EXCLUDE_FEATURES_DYNAMIC }},${{ steps.rustc-llvm.outputs.exclude-features }},${{ matrix.platform.exclude-features }} \
+            --features ${{ env.LLVM_FEATURES_DYNAMIC }}
+
+      - uses: actions/checkout@v7
+        if: runner.os == 'Linux' && steps.rustc-llvm.outputs.llvm == env.LATEST_LLVM
+        with:
+          repository: aya-rs/aya
+          path: aya
+          submodules: recursive
+
+      - name: Install (dynamic)
+        if: endsWith(matrix.platform.target, 'gnu') && steps.rustc-llvm.outputs.llvm == env.LATEST_LLVM
+        run: |
+          cargo install --path . --no-default-features --features \
+            ${{ env.LLVM_FEATURES_DYNAMIC }}
+
+      - name: Install autopoint for aya integration tests
+        if: runner.os == 'Linux' && steps.rustc-llvm.outputs.llvm == env.LATEST_LLVM
+        run: sudo apt -y install autopoint
+
+      - name: Run aya integration tests
+        if: runner.os == 'Linux' && steps.rustc-llvm.outputs.llvm == env.LATEST_LLVM
+        working-directory: aya
+        env:
+          RUST_NIGHTLY: ${{ fromJSON(needs.prepare.outputs.rust-toolchains).nightly }}
+        run: |
+          set -euo pipefail
+
+          rustup toolchain install "$RUST_NIGHTLY" \
+            --component rust-src --profile minimal --no-self-update
+          # Aya invokes `nightly` internally; point it at the validated dated nightly.
+          ln -s "$(rustup run "$RUST_NIGHTLY" rustc --print sysroot)" \
+            "$(rustup show home)/toolchains/nightly-$(rustup run "$RUST_NIGHTLY" rustc --print host-tuple)"
+          cargo xtask integration-test local
+
+      - name: Enforce static linking
+        # Static linking with glibc is not supported.
+        if: ${{ !endsWith(matrix.platform.target, 'gnu') }}
+        run: echo "RUSTFLAGS=-C target-feature=+crt-static" >> $GITHUB_ENV
+
+      - name: Check (static linking, single feature set)
+        if: ${{ !endsWith(matrix.platform.target, 'gnu') }}
+        # Static linking in combination with `cargo hack --feature-powerset`
+        # (multiple builds) increases the disk usage massively. Therefore we
+        # perform all static builds with only one fixed feature set.
+        run: |
+          cargo check --target ${{ matrix.platform.target }} \
+            --no-default-features --features ${{ env.LLVM_FEATURES_STATIC }}
+
+      - name: Build (static linking, single feature set)
+        if: ${{ !endsWith(matrix.platform.target, 'gnu') }}
+        run: |
+          cargo build --target ${{ matrix.platform.target }} \
+            --no-default-features --features ${{ env.LLVM_FEATURES_STATIC }}
+
+      - name: Test (sysroot built on demand, static linking)
+        if: ${{ !endsWith(matrix.platform.target, 'gnu') }}
+        run: |
+          RUSTC_BOOTSTRAP=1 cargo test --target ${{ matrix.platform.target }} \
+            --no-default-features --features ${{ env.LLVM_FEATURES_STATIC }}
+
+      - name: Test (prebuilt BPF standard library, static linking)
+        if: ${{ !endsWith(matrix.platform.target, 'gnu') }}
+        run: |
+          BPFEL_SYSROOT_DIR="$(pwd)/bpf-sysroot" \
+            cargo test --target ${{ matrix.platform.target }} \
+            --no-default-features --features ${{ env.LLVM_FEATURES_STATIC }}
+
+      - name: Report disk usage
+        if: ${{ always() }}
+        uses: ./bpf-linker/.github/actions/report-disk-usage
+
+  release:
+    name: release
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      # Upload published GitHub release assets.
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build release
+        run: |
+          set -euo pipefail
+
+          bazel build //:release-archives \
+            --config=release \
+            --config=remote \
+            --remote_header=x-buildbuddy-api-key="$BUILDBUDDY_API_KEY"
+
+          mkdir -p dist
+          # Rename bazel-out/<target>-opt-.../bin/bpf-linker-release[-debuginfo].tar.zst
+          # to dist/bpf-linker-<target>[-debuginfo].tar.zst.
+          while IFS= read -r src; do
+            relative="${src#bazel-out/}"
+            target="${relative%%-opt*}"
+            archive_name="${src##*/}"
+            archive_suffix="${archive_name#bpf-linker-release}"
+            install -m 0644 "$src" "dist/bpf-linker-${target}${archive_suffix}"
+          done < <(bazel cquery //:release-archives \
+            --output=files \
+            --config=release \
+            --config=remote)
+
+      - name: Upload release assets
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/*
+
+  check:
+    if: always()
+    needs:
+      - prepare
+      - lint-stable
+      - lint-nightly
+      - bazel
+      - build
+      - release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all required jobs succeeded
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: jq --exit-status 'length > 0 and all(.[]; . == "success")' <<< "$RESULTS"

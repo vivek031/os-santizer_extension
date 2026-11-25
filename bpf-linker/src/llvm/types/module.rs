@@ -1,0 +1,108 @@
+use std::{ffi::CStr, marker::PhantomData};
+
+use libc::c_char;
+use llvm_sys::{
+    bit_writer::LLVMWriteBitcodeToFile,
+    core::{
+        LLVMCreateMemoryBufferWithMemoryRangeCopy, LLVMDisposeMessage, LLVMDisposeModule,
+        LLVMGetTarget, LLVMPrintModuleToFile, LLVMPrintModuleToString,
+    },
+    debuginfo::LLVMStripModuleDebugInfo,
+    prelude::{LLVMModuleRef, LLVMValueRef},
+};
+
+use crate::llvm::{
+    MemoryBuffer, Message,
+    iter::{IterModuleFunctions as _, IterModuleGlobalAliases as _, IterModuleGlobals as _},
+    types::context::LLVMContext,
+};
+
+pub(crate) struct LLVMModule<'ctx> {
+    pub(super) module: LLVMModuleRef,
+    pub(super) _marker: PhantomData<&'ctx LLVMContext>,
+}
+
+impl LLVMModule<'_> {
+    /// Returns an unsafe mutable pointer to the LLVM module.
+    ///
+    /// The caller must ensure that the [`LLVMModule`] outlives the pointer this
+    /// function returns, or else it will end up dangling.
+    pub(in crate::llvm) const fn as_mut_ptr(&self) -> LLVMModuleRef {
+        self.module
+    }
+
+    pub(crate) fn get_target(&self) -> *const c_char {
+        unsafe { LLVMGetTarget(self.module) }
+    }
+
+    pub(crate) fn write_bitcode_to_path(&self, path: &CStr) -> Result<(), std::io::Error> {
+        if unsafe { LLVMWriteBitcodeToFile(self.module, path.as_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn write_bitcode_to_memory(&self) -> MemoryBuffer {
+        let buf = unsafe { llvm_sys::bit_writer::LLVMWriteBitcodeToMemoryBuffer(self.module) };
+
+        MemoryBuffer::new(buf)
+    }
+
+    pub(crate) fn write_ir_to_path(&self, path: &CStr) -> Result<(), String> {
+        let (ret, message) = unsafe {
+            Message::with(|message| LLVMPrintModuleToFile(self.module, path.as_ptr(), message))
+        };
+
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(message.as_string_lossy().to_string())
+        }
+    }
+
+    pub(crate) fn write_ir_to_memory(&self) -> MemoryBuffer {
+        // Format the module to a string, then copy into a MemoryBuffer. We do the extra copy to keep the
+        // internal API simpler, as all the other codegen methods output a MemoryBuffer.
+        unsafe {
+            let ptr = LLVMPrintModuleToString(self.module);
+            scopeguard::defer!(LLVMDisposeMessage(ptr));
+            let cstr = CStr::from_ptr(ptr);
+            let bytes = cstr.to_bytes();
+
+            let buffer_name = c"mem_buffer";
+
+            // Copy bytes into a new LLVMMemoryBuffer so we can safely dispose the message.
+            let memory_buffer = LLVMCreateMemoryBufferWithMemoryRangeCopy(
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                buffer_name.as_ptr(),
+            );
+
+            MemoryBuffer::new(memory_buffer)
+        }
+    }
+
+    /// strips debug information, returns true if DI got stripped
+    pub(crate) fn strip_debug_info(&mut self) -> bool {
+        unsafe { LLVMStripModuleDebugInfo(self.module) != 0 }
+    }
+
+    pub(crate) fn functions(&self) -> impl Iterator<Item = LLVMValueRef> {
+        self.module.functions_iter()
+    }
+
+    pub(crate) fn globals(&self) -> impl Iterator<Item = LLVMValueRef> {
+        self.module.globals_iter()
+    }
+
+    pub(crate) fn global_aliases(&self) -> impl Iterator<Item = LLVMValueRef> {
+        self.module.global_aliases_iter()
+    }
+}
+
+impl Drop for LLVMModule<'_> {
+    fn drop(&mut self) {
+        unsafe { LLVMDisposeModule(self.module) };
+    }
+}
