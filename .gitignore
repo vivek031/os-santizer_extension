@@ -1,7 +1,35 @@
+### Rust build artifacts
 target/
+debug/
+**/*.rs.bk
+
+### IDE & Editor files
+.idea/
+
+### Crash dumps and scratch logs
 *.core
 vgcore.*
 ~san.log
-os-sanitizer/calibration/data/
+__pycache__/
+
+### Generated eBPF bindings (regenerate with aya-tool, see README)
+os-sanitizer/os-sanitizer-ebpf/src/binding.rs
+
+### Large benchmark inputs & raw test outputs (exceed GitHub limits)
 os-sanitizer/evaluation/quickbench/results/
 os-sanitizer/evaluation/quickbench/inputs/data.tar
+os-sanitizer/evaluation/quickbench/inputs/corpus.txt
+os-sanitizer/calibration/data/enriched_*/
+
+### LaTeX build artifacts
+*.aux
+*.fdb_latexmk
+*.fls
+*.lof
+*.lot
+*.log
+*.out
+*.toc
+*.synctex.gz
+build*.log
+pdflatex*.fls
